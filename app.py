@@ -55,6 +55,13 @@ def init_db():
                   FOREIGN KEY(player_id) REFERENCES players(id), 
                   FOREIGN KEY(match_id) REFERENCES matches(id),
                   UNIQUE(user_id, player_id, match_id))''')
+    
+    # CREACIÓN DEL USUARIO MAESTRO POR DEFECTO
+    c.execute("SELECT * FROM users WHERE username='usuariomaestro'")
+    if not c.fetchone():
+        hashed_pw = generate_password_hash("1234")
+        c.execute("INSERT INTO users (username, password, role, rupias, total_points) VALUES (?, ?, ?, ?, ?)", 
+                  ('usuariomaestro', hashed_pw, 'admin', 9999, 0))
         
     conn.commit()
     conn.close()
@@ -120,12 +127,12 @@ def show_next_match_banner():
     next_match = run_query("SELECT rival, match_date, match_time FROM matches WHERE status='PENDIENTE' ORDER BY id DESC LIMIT 1")
     if next_match:
         rival, match_date, match_time = next_match[0]
-        st.info(f"⚽ **Próximo Partido:** vs **{rival}** | 📅 **Fecha:** {match_date} | 🕒 **Hora:** {match_time} — *Fecha límite para alinear tus 4 titulares*")
+        st.info(f"⚽ **Próximo Partido:** vs **{rival}** | 📅 **Fecha:** {match_date} | 🕒 **Hora:** {match_time} — *Alinea a tus 4 titulares antes de esta fecha*")
     else:
         st.warning("⚠️ No hay ningún partido programado en este momento.")
 
 # ==========================================
-# 4. AUTENTICACIÓN Y REGISTRO INTELIGENTE
+# 4. AUTENTICACIÓN
 # ==========================================
 def login_user(username, password):
     user = run_query("SELECT id, password, role, rupias FROM users WHERE username=?", (username,))
@@ -139,19 +146,16 @@ def login_user(username, password):
         st.error("Usuario o contraseña incorrectos")
 
 def register_user(username, password):
+    if username.lower() == 'usuariomaestro':
+        st.error("Ese nombre de usuario está reservado.")
+        return
+        
     try:
         hashed_pw = generate_password_hash(password)
-        users_count = run_query("SELECT COUNT(*) FROM users")[0][0]
-        
-        if users_count == 0:
-            run_query("INSERT INTO users (username, password, role, rupias, total_points) VALUES (?, ?, ?, ?, 0)", 
-                      (username, hashed_pw, 'admin', 999))
-            st.success("👑 ¡Cuenta creada! Eres el primer usuario y se te ha asignado el rol de ADMINISTRADOR.")
-        else:
-            run_query("INSERT INTO users (username, password, role, rupias, total_points) VALUES (?, ?, ?, ?, 0)", 
-                      (username, hashed_pw, 'user', 20))
-            st.success("✅ Cuenta de jugador creada exitosamente. ¡Ya puedes iniciar sesión!")
-            
+        # Todos los registros web son jugadores normales con 20 rupias
+        run_query("INSERT INTO users (username, password, role, rupias, total_points) VALUES (?, ?, ?, ?, 0)", 
+                  (username, hashed_pw, 'user', 20))
+        st.success("✅ Cuenta de jugador creada exitosamente. ¡Ya puedes iniciar sesión!")
     except sqlite3.IntegrityError:
         st.error("El nombre de usuario ya existe. Por favor, elige otro.")
 
@@ -160,15 +164,15 @@ def register_user(username, password):
 # ==========================================
 def admin_panel():
     show_next_match_banner()
-    st.header("👑 Panel de Administrador")
-    st.write("Bienvenido. Como administrador, **no participas en la liga** y este es tu panel exclusivo de gestión.")
+    st.header("👑 Panel del Usuario Maestro")
+    st.write("Panel exclusivo de gestión. Tú eres quien controla la liga, añade jugadores y contabiliza puntos.")
     
-    tab1, tab2, tab3 = st.tabs(["📅 Partidos y Horarios", "⚽ Jugadores del Club", "📊 Carga de Estadísticas y Puntos"])
+    tab1, tab2, tab3 = st.tabs(["📅 Subir Partidos", "⚽ Añadir Jugadores", "📊 Subir Estadísticas"])
     
     with tab1:
-        st.subheader("Programar Nuevo Partido (Fecha Límite)")
+        st.subheader("Programar Nuevo Partido")
         with st.form("add_match"):
-            rival = st.text_input("Nombre del Rival")
+            rival = st.text_input("Nombre del Equipo Rival")
             match_date = st.date_input("Fecha del Partido")
             match_time = st.time_input("Hora del Partido")
             submit_match = st.form_submit_button("Guardar Partido")
@@ -184,12 +188,12 @@ def admin_panel():
         st.dataframe(matches_df, use_container_width=True)
 
     with tab2:
-        st.subheader("Añadir Nuevo Futbolista")
+        st.subheader("Dar de alta a un Futbolista")
         with st.form("add_player"):
             name = st.text_input("Nombre del jugador")
             position = st.selectbox("Posición", ["POR", "DEF", "MED", "DEL"])
             price = st.number_input("Precio Inicial (Rupias)", min_value=1, value=5)
-            submitted = st.form_submit_button("Añadir Futbolista")
+            submitted = st.form_submit_button("Añadir al Mercado")
             if submitted and name:
                 run_query("INSERT INTO players (name, position, price, points) VALUES (?, ?, ?, 0)", 
                           (name, position, price))
@@ -202,7 +206,7 @@ def admin_panel():
 
     with tab3:
         st.subheader("⚽ Introducción de Estadísticas de la Jornada")
-        st.write("Selecciona el partido finalizado para introducir las estadísticas oficiales de los futbolistas (LaLiga Fantasy) y sumar la **nota media asignada por los usuarios**.")
+        st.write("Selecciona el partido finalizado para introducir las estadísticas oficiales y sumar la **nota media asignada por los usuarios**.")
         
         matches_list = get_dataframe("SELECT id, rival, match_date, status FROM matches ORDER BY id DESC")
         if matches_list.empty:
@@ -214,7 +218,7 @@ def admin_panel():
             
             players = get_dataframe("SELECT id, name, position FROM players")
             if players.empty:
-                st.info("Añade primero futbolistas en la pestaña 'Jugadores del Club'.")
+                st.info("Añade primero futbolistas en la pestaña 'Añadir Jugadores'.")
             else:
                 with st.form("match_stats_form"):
                     player_stats_inputs = {}
@@ -245,3 +249,60 @@ def admin_panel():
                             
                             total_match_pts = stat_pts + user_avg_pts
                             if total_match_pts != 0:
+                                run_query("UPDATE players SET points = points + ? WHERE id = ?", (total_match_pts, p_id))
+                                starters = run_query("SELECT user_id FROM user_squads WHERE player_id = ? AND is_starter = 1", (p_id,))
+                                for u in starters:
+                                    run_query("UPDATE users SET total_points = total_points + ? WHERE id = ?", (total_match_pts, u[0]))
+                                    
+                        run_query("UPDATE matches SET status = 'FINALIZADO' WHERE id = ?", (selected_match_id,))
+                        st.success("¡Puntos de la jornada calculados y sumados con éxito a la clasificación!")
+                        st.rerun()
+
+def user_panel():
+    user_id = st.session_state['user_id']
+    rupias = run_query("SELECT rupias FROM users WHERE id=?", (user_id,))[0][0]
+    
+    show_next_match_banner()
+    
+    st.sidebar.title(f"👤 {st.session_state['username']}")
+    st.sidebar.subheader(f"💰 Tus Rupias: {rupias}")
+    
+    menu = st.sidebar.radio("Navegación", ["Mi Plantilla", "Mercado", "⭐ Votar Jugadores", "🏆 Clasificación"])
+    
+    if menu == "⭐ Votar Jugadores":
+        st.header("⭐ Votación de Jugadores")
+        st.write("Valora la actuación de cada futbolista (de 1 a 5). La votación abre **5 horas después** del inicio del partido y cierra a las **48 horas**.")
+        
+        matches_df = get_dataframe("SELECT id, rival, match_date, match_time FROM matches ORDER BY id DESC")
+        if matches_df.empty:
+            st.info("Aún no se ha programado ningún partido.")
+        else:
+            now = datetime.now()
+            match_options = {}
+            match_status_dict = {}
+            for idx, row in matches_df.iterrows():
+                try:
+                    time_str = str(row['match_time']).split('.')[0]
+                    dt_str = f"{row['match_date']} {time_str}"
+                    match_dt = datetime.strptime(dt_str, "%Y-%m-%d %H:%M:%S") if len(time_str.split(':')) == 3 else datetime.strptime(dt_str, "%Y-%m-%d %H:%M")
+                    
+                    t_start = match_dt + timedelta(hours=5)
+                    t_end = match_dt + timedelta(hours=48)
+                    label = f"vs {row['rival']} ({row['match_date']})"
+                    match_options[label] = row['id']
+                    
+                    if now < t_start:
+                        status, time_left = "NOT_OPEN", t_start - now
+                    elif t_start <= now <= t_end:
+                        status, time_left = "OPEN", t_end - now
+                    else:
+                        status, time_left = "CLOSED", timedelta(0)
+                        
+                    match_status_dict[row['id']] = {"status": status, "time_left": time_left, "t_start": t_start, "t_end": t_end}
+                except Exception:
+                    continue
+
+            if not match_options:
+                st.warning("No hay partidos válidos registrados.")
+            else:
+                selected_match_name = st.selectbox("Sele
