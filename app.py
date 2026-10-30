@@ -14,10 +14,25 @@ import streamlit as st
 from werkzeug.security import check_password_hash, generate_password_hash
 
 
+def get_config_value(name: str, default: str = "") -> str:
+    """Lee configuración desde variables de entorno o desde Streamlit Secrets."""
+    value = os.environ.get(name)
+    if value is not None and str(value).strip():
+        return str(value).strip()
+
+    try:
+        value = st.secrets.get(name, default)
+    except Exception:
+        # En ejecución local puede no existir el archivo .streamlit/secrets.toml.
+        value = default
+
+    return str(value if value is not None else default).strip()
+
+
 # ============================================================
 # CONFIGURACIÓN
 # ============================================================
-DB_PATH = os.environ.get("FANTASY_DB_PATH", "fantasy.db")
+DB_PATH = get_config_value("FANTASY_DB_PATH", "fantasy.db")
 ADMIN_USERNAME = "usuariomaestro"
 ADMIN_PASSWORD_ENV = "FANTASY_ADMIN_PASSWORD"
 VOTING_OPENS_AFTER_HOURS = 5
@@ -97,7 +112,7 @@ def _ensure_column(
 
 def init_db() -> None:
     """Crea el esquema y migra las instalaciones anteriores sin borrar datos."""
-    admin_password = os.environ.get(ADMIN_PASSWORD_ENV, "").strip()
+    admin_password = get_config_value(ADMIN_PASSWORD_ENV)
     if admin_password and len(admin_password) < 12:
         raise ValueError(
             f"{ADMIN_PASSWORD_ENV} debe tener al menos 12 caracteres."
@@ -295,11 +310,11 @@ def admin_setup_needed() -> bool:
         "SELECT password FROM users WHERE LOWER(username)=? LIMIT 1", (ADMIN_USERNAME,)
     )
     if not rows:
-        return not os.environ.get(ADMIN_PASSWORD_ENV, "").strip()
+        return not get_config_value(ADMIN_PASSWORD_ENV)
     try:
-        return check_password_hash(rows[0]["password"], "1234") and not os.environ.get(
-            ADMIN_PASSWORD_ENV, ""
-        ).strip()
+        return check_password_hash(rows[0]["password"], "1234") and not get_config_value(
+            ADMIN_PASSWORD_ENV
+        )
     except (ValueError, TypeError):
         return False
 
@@ -1389,4 +1404,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
