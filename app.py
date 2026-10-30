@@ -284,6 +284,35 @@ def init_db() -> None:
                 FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE RESTRICT
             )"""
         )
+        # Registro auditable para borrar/restaurar solo los puntos concedidos a managers.
+        # Los puntos individuales de los jugadores permanecen intactos.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS manager_points_reset_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                match_id INTEGER NOT NULL,
+                reset_at TEXT NOT NULL,
+                reset_by TEXT NOT NULL DEFAULT 'usuariomaestro',
+                status TEXT NOT NULL DEFAULT 'ACTIVE'
+                    CHECK(status IN ('ACTIVE', 'RESTORED', 'INVALIDATED')),
+                managers_affected INTEGER NOT NULL DEFAULT 0,
+                history_rows INTEGER NOT NULL DEFAULT 0,
+                points_removed REAL NOT NULL DEFAULT 0,
+                restored_at TEXT,
+                FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE RESTRICT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS manager_points_reset_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                reset_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                player_id INTEGER,
+                points_awarded REAL NOT NULL,
+                FOREIGN KEY(reset_id) REFERENCES manager_points_reset_logs(id) ON DELETE CASCADE,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE SET NULL
+            )"""
+        )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS match_player_history (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -427,6 +456,14 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_player_history_match "
             "ON match_player_history(match_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_manager_points_reset_match_status "
+            "ON manager_points_reset_logs(match_id, status)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_manager_points_reset_items_reset "
+            "ON manager_points_reset_items(reset_id)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_match_user_snapshot_eligible "
@@ -903,6 +940,15 @@ def delete_manager_account(user_id: int) -> str:
         if user is None or user["role"] != "user":
             raise ValueError("La cuenta no existe o no es una cuenta de manager. El administrador está protegido.")
 
+        # Un borrado de puntos que incluya a este manager ya no podrá restaurarse
+        # íntegramente si se elimina su cuenta; se invalida y se limpian sus copias.
+        conn.execute(
+            "UPDATE manager_points_reset_logs SET status='INVALIDATED' "
+            "WHERE id IN (SELECT reset_id FROM manager_points_reset_items WHERE user_id=?) "
+            "AND status='ACTIVE'",
+            (int(user_id),),
+        )
+        conn.execute("DELETE FROM manager_points_reset_items WHERE user_id=?", (int(user_id),))
         # Borrar primero las tablas que tienen claves foráneas restrictivas.
         conn.execute("DELETE FROM user_squads WHERE user_id=?", (int(user_id),))
         conn.execute("DELETE FROM ratings WHERE user_id=?", (int(user_id),))
@@ -1267,6 +1313,178 @@ def reverse_match(match_id: int) -> None:
         conn.execute(
             "UPDATE matches SET status='PENDIENTE' WHERE id=?", (int(match_id),)
         )
+        # Si antes se habían borrado solo los puntos de managers, la reversión
+        # completa hace que la antigua copia deje de poder restaurarse.
+        conn.execute(
+            "UPDATE manager_points_reset_logs SET status='INVALIDATED' "
+            "WHERE match_id=? AND status='ACTIVE'",
+            (int(match_id),),
+        )
+
+
+def reset_manager_points_for_match(match_id: int, reset_by: str = ADMIN_USERNAME) -> dict[str, Any]:
+    """Elimina solo los puntos de managers de un partido finalizado.
+
+    Conserva los puntos acumulados de los jugadores, el estado del partido,
+    las votaciones y la fotografía de las plantillas. Guarda una copia auditable
+    para permitir restaurar los puntos de los managers si fue un error.
+    """
+    with db_transaction() as conn:
+        match = conn.execute(
+            "SELECT id, jornada, rival, status FROM matches WHERE id=?",
+            (int(match_id),),
+        ).fetchone()
+        if match is None or match["status"] != "FINALIZADO":
+            raise ValueError("Solo se pueden borrar puntos de managers de un partido finalizado.")
+
+        active_reset = conn.execute(
+            "SELECT id FROM manager_points_reset_logs "
+            "WHERE match_id=? AND status='ACTIVE' ORDER BY id DESC LIMIT 1",
+            (int(match_id),),
+        ).fetchone()
+        if active_reset:
+            raise ValueError(
+                "Los puntos de los managers de este partido ya están borrados. "
+                "Puedes restaurarlos desde el apartado de administración."
+            )
+
+        history_rows = conn.execute(
+            "SELECT id, user_id, player_id, points_awarded FROM match_history "
+            "WHERE match_id=? ORDER BY id",
+            (int(match_id),),
+        ).fetchall()
+        if not history_rows:
+            raise ValueError("Este partido no tiene puntos de managers registrados para borrar.")
+
+        user_totals: dict[int, float] = {}
+        for row in history_rows:
+            user_id = int(row["user_id"])
+            user_totals[user_id] = user_totals.get(user_id, 0.0) + float(row["points_awarded"] or 0.0)
+
+        total_removed = sum(user_totals.values())
+        reset_cursor = conn.execute(
+            """INSERT INTO manager_points_reset_logs(
+                   match_id, reset_at, reset_by, status, managers_affected,
+                   history_rows, points_removed
+               ) VALUES (?, ?, ?, 'ACTIVE', ?, ?, ?)""",
+            (
+                int(match_id),
+                now_local().isoformat(timespec="seconds"),
+                str(reset_by or ADMIN_USERNAME)[:100],
+                len(user_totals),
+                len(history_rows),
+                round(total_removed, 2),
+            ),
+        )
+        reset_id = int(reset_cursor.lastrowid)
+
+        conn.executemany(
+            """INSERT INTO manager_points_reset_items(
+                   reset_id, user_id, player_id, points_awarded
+               ) VALUES (?, ?, ?, ?)""",
+            [
+                (
+                    reset_id,
+                    int(row["user_id"]),
+                    int(row["player_id"]) if row["player_id"] is not None else None,
+                    float(row["points_awarded"] or 0.0),
+                )
+                for row in history_rows
+            ],
+        )
+
+        for user_id, points_to_remove in user_totals.items():
+            cursor = conn.execute(
+                "UPDATE users SET total_points=ROUND(COALESCE(total_points, 0)-?, 2) "
+                "WHERE id=? AND role='user'",
+                (points_to_remove, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"No se pudo actualizar el manager ID {user_id}; no se aplicó ningún cambio."
+                )
+
+        conn.execute("DELETE FROM match_history WHERE match_id=?", (int(match_id),))
+        return {
+            "reset_id": reset_id,
+            "managers_affected": len(user_totals),
+            "history_rows": len(history_rows),
+            "points_removed": round(total_removed, 2),
+            "jornada": str(match["jornada"]),
+            "rival": str(match["rival"]),
+        }
+
+
+def restore_manager_points_for_match(match_id: int) -> dict[str, Any]:
+    """Restaura el último borrado activo de puntos de managers de un partido."""
+    with db_transaction() as conn:
+        match = conn.execute(
+            "SELECT id, jornada, rival, status FROM matches WHERE id=?",
+            (int(match_id),),
+        ).fetchone()
+        if match is None or match["status"] != "FINALIZADO":
+            raise ValueError("Solo se pueden restaurar puntos de managers si el partido sigue finalizado.")
+
+        reset_log = conn.execute(
+            "SELECT id FROM manager_points_reset_logs "
+            "WHERE match_id=? AND status='ACTIVE' ORDER BY id DESC LIMIT 1",
+            (int(match_id),),
+        ).fetchone()
+        if reset_log is None:
+            raise ValueError("No hay ningún borrado de puntos pendiente de restaurar para este partido.")
+
+        existing_history = conn.execute(
+            "SELECT 1 FROM match_history WHERE match_id=? LIMIT 1",
+            (int(match_id),),
+        ).fetchone()
+        if existing_history:
+            raise ValueError(
+                "Ya existen puntos de managers registrados para este partido. "
+                "No se pueden restaurar para evitar duplicidades."
+            )
+
+        items = conn.execute(
+            "SELECT user_id, player_id, points_awarded FROM manager_points_reset_items "
+            "WHERE reset_id=? ORDER BY id",
+            (int(reset_log["id"]),),
+        ).fetchall()
+        if not items:
+            raise ValueError("No se encontró la copia de seguridad de los puntos de managers.")
+
+        for item in items:
+            user_id = int(item["user_id"])
+            points = float(item["points_awarded"] or 0.0)
+            cursor = conn.execute(
+                "UPDATE users SET total_points=ROUND(COALESCE(total_points, 0)+?, 2) "
+                "WHERE id=? AND role='user'",
+                (points, user_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(
+                    f"No existe el manager ID {user_id}; no se restauraron los puntos."
+                )
+            conn.execute(
+                "INSERT INTO match_history(match_id, user_id, points_awarded, player_id) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    int(match_id),
+                    user_id,
+                    points,
+                    int(item["player_id"]) if item["player_id"] is not None else None,
+                ),
+            )
+
+        conn.execute(
+            "UPDATE manager_points_reset_logs SET status='RESTORED', restored_at=? WHERE id=?",
+            (now_local().isoformat(timespec="seconds"), int(reset_log["id"])),
+        )
+        return {
+            "managers_affected": len({int(item["user_id"]) for item in items}),
+            "history_rows": len(items),
+            "points_restored": round(sum(float(item["points_awarded"] or 0.0) for item in items), 2),
+            "jornada": str(match["jornada"]),
+            "rival": str(match["rival"]),
+        }
 
 
 # ============================================================
@@ -1582,6 +1800,97 @@ def admin_panel() -> None:
                 if _show_operation_error(lambda: reverse_match(reverse_id)):
                     st.success("Puntuaciones revertidas; el partido vuelve a estar pendiente.")
                     st.rerun()
+
+        st.divider()
+        st.subheader("🧹 Borrar únicamente los puntos de los managers")
+        st.caption(
+            "Esta operación elimina de la clasificación de managers los puntos de un partido concreto. "
+            "NO modifica los puntos acumulados de los futbolistas, las votaciones, el estado del partido "
+            "ni la fotografía de las plantillas. Se guarda una copia para poder restaurarlos."
+        )
+        if finished_df.empty:
+            st.info("No hay partidos finalizados disponibles para esta operación.")
+        else:
+            manager_points_options = {
+                f"ID {int(row['id'])} — {row['jornada']} vs {row['rival']}": int(row["id"])
+                for _, row in finished_df.iterrows()
+            }
+            manager_points_label = st.selectbox(
+                "Partido cuyos puntos de managers quieres gestionar",
+                list(manager_points_options.keys()),
+                key="manager_points_match_select",
+            )
+            manager_points_match_id = manager_points_options[manager_points_label]
+            summary = run_query(
+                "SELECT COUNT(*) AS rows_count, COUNT(DISTINCT user_id) AS managers_count, "
+                "COALESCE(SUM(points_awarded), 0) AS points_total "
+                "FROM match_history WHERE match_id=?",
+                (manager_points_match_id,),
+            )[0]
+            active_reset = run_query(
+                "SELECT id, reset_at, reset_by, managers_affected, history_rows, points_removed "
+                "FROM manager_points_reset_logs WHERE match_id=? AND status='ACTIVE' "
+                "ORDER BY id DESC LIMIT 1",
+                (manager_points_match_id,),
+            )
+            info_cols = st.columns(3)
+            info_cols[0].metric("Managers con puntos", int(summary["managers_count"]))
+            info_cols[1].metric("Registros de puntos", int(summary["rows_count"]))
+            info_cols[2].metric("Puntos de managers", f"{float(summary['points_total']):.2f}")
+
+            if active_reset:
+                reset = active_reset[0]
+                st.warning(
+                    "Los puntos de managers de este partido ya están borrados. "
+                    f"Operación realizada el {reset['reset_at']} por {reset['reset_by']}. "
+                    "Los puntos individuales de los futbolistas permanecen intactos."
+                )
+                if st.button(
+                    "↩️ Restaurar los puntos de los managers",
+                    key="restore_manager_points_button",
+                ):
+                    result = {}
+                    if _show_operation_error(
+                        lambda: result.update(restore_manager_points_for_match(manager_points_match_id))
+                    ):
+                        st.success(
+                            f"Puntos restaurados para {result['managers_affected']} managers "
+                            f"({result['points_restored']:.2f} puntos en total)."
+                        )
+                        st.rerun()
+            elif int(summary["rows_count"]) == 0:
+                st.info("Este partido no tiene puntos de managers registrados para borrar.")
+            else:
+                with st.form("reset_manager_points_form"):
+                    st.warning(
+                        "Acción administrativa: se eliminarán todos los puntos que este partido "
+                        "aportó a los managers. Los puntos de los jugadores no se modificarán."
+                    )
+                    confirmation = st.text_input(
+                        'Escribe BORRAR PUNTOS para confirmar',
+                        key="reset_manager_points_confirmation",
+                    )
+                    reset_submitted = st.form_submit_button("🗑️ Borrar puntos de managers")
+                if reset_submitted:
+                    if confirmation.strip().upper() != "BORRAR PUNTOS":
+                        st.error("Confirmación incorrecta. Escribe exactamente BORRAR PUNTOS.")
+                    else:
+                        result = {}
+                        if _show_operation_error(
+                            lambda: result.update(
+                                reset_manager_points_for_match(
+                                    manager_points_match_id,
+                                    str(st.session_state.get("username", ADMIN_USERNAME)),
+                                )
+                            )
+                        ):
+                            st.success(
+                                f"Se han borrado los puntos de {result['managers_affected']} managers "
+                                f"({result['points_removed']:.2f} puntos). "
+                                "Los puntos individuales de los jugadores no han cambiado. "
+                                "Puedes restaurar los puntos desde este mismo apartado."
+                            )
+                            st.rerun()
 
     with t5:
         st.subheader("👥 Cuentas y perfiles registrados")
@@ -2506,4 +2815,5 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
 
