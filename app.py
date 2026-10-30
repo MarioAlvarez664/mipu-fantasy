@@ -295,6 +295,42 @@ def init_db() -> None:
                 UNIQUE(match_id, player_id)
             )"""
         )
+        # Fotografía de las plantillas en el inicio del partido.
+        # Se captura al procesar la jornada, pero representa el estado del kickoff
+        # porque el mercado y las plantillas quedan bloqueados desde ese instante.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS match_snapshot_meta (
+                match_id INTEGER PRIMARY KEY,
+                kickoff_at TEXT NOT NULL,
+                captured_at TEXT,
+                managers_count INTEGER NOT NULL DEFAULT 0,
+                snapshot_status TEXT NOT NULL DEFAULT 'CAPTURED',
+                FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE RESTRICT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS match_user_snapshot (
+                match_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                starter_count INTEGER NOT NULL DEFAULT 0,
+                eligible INTEGER NOT NULL DEFAULT 0 CHECK(eligible IN (0, 1)),
+                PRIMARY KEY(match_id, user_id),
+                FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE RESTRICT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE RESTRICT
+            )"""
+        )
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS match_squad_snapshot (
+                match_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                player_id INTEGER NOT NULL,
+                is_starter INTEGER NOT NULL DEFAULT 0 CHECK(is_starter IN (0, 1)),
+                PRIMARY KEY(match_id, user_id, player_id),
+                FOREIGN KEY(match_id) REFERENCES matches(id) ON DELETE RESTRICT,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE RESTRICT,
+                FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE RESTRICT
+            )"""
+        )
         conn.execute(
             """CREATE TABLE IF NOT EXISTS market_updates (
                 update_key TEXT PRIMARY KEY,
@@ -391,6 +427,14 @@ def init_db() -> None:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_player_history_match "
             "ON match_player_history(match_id)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_match_user_snapshot_eligible "
+            "ON match_user_snapshot(match_id, eligible, starter_count)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_match_squad_snapshot_player "
+            "ON match_squad_snapshot(match_id, player_id, is_starter)"
         )
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_market_price_player_date "
@@ -781,10 +825,13 @@ def delete_player(player_id: int) -> None:
         has_user_history = conn.execute(
             "SELECT 1 FROM match_history WHERE player_id=? LIMIT 1", (int(player_id),)
         ).fetchone()
-        if abs(float(player["points"] or 0)) > 0.0001 or has_history or has_final_rating or has_user_history:
+        has_kickoff_snapshot = conn.execute(
+            "SELECT 1 FROM match_squad_snapshot WHERE player_id=? LIMIT 1", (int(player_id),)
+        ).fetchone()
+        if abs(float(player["points"] or 0)) > 0.0001 or has_history or has_final_rating or has_user_history or has_kickoff_snapshot:
             raise ValueError(
-                "No se puede borrar un jugador con puntuaciones o historial de partidos. "
-                "Conserva el registro para poder revertir jornadas correctamente."
+                "No se puede borrar un jugador con puntuaciones, historial o una fotografía de plantilla de un partido. "
+                "Conserva el registro para mantener la trazabilidad y poder revertir jornadas."
             )
         conn.execute("DELETE FROM user_squads WHERE player_id=?", (int(player_id),))
         conn.execute("DELETE FROM ratings WHERE player_id=?", (int(player_id),))
@@ -860,6 +907,8 @@ def delete_manager_account(user_id: int) -> str:
         conn.execute("DELETE FROM user_squads WHERE user_id=?", (int(user_id),))
         conn.execute("DELETE FROM ratings WHERE user_id=?", (int(user_id),))
         conn.execute("DELETE FROM match_history WHERE user_id=?", (int(user_id),))
+        conn.execute("DELETE FROM match_squad_snapshot WHERE user_id=?", (int(user_id),))
+        conn.execute("DELETE FROM match_user_snapshot WHERE user_id=?", (int(user_id),))
         cursor = conn.execute(
             "DELETE FROM users WHERE id=? AND role='user'", (int(user_id),)
         )
@@ -994,7 +1043,21 @@ def submit_ratings(user_id: int, match_id: int, ratings: dict[int, int]) -> None
 
 
 def process_match(match_id: int, stats: dict[int, dict[str, Any]]) -> None:
-    """Calcula y guarda la jornada completa dentro de una única transacción."""
+    """
+    Procesa un partido usando la plantilla que estaba congelada en su kickoff.
+
+    Las plantillas se bloquean desde el inicio del primer partido pendiente. Por
+    ello, aunque la fotografía se persista cuando se procesa la jornada (tras el
+    cierre de votaciones), el contenido representa el estado de la plantilla en
+    el momento de inicio del partido.
+
+    Solo reciben puntos los managers que, en ese instante:
+      1) tenían al futbolista en su plantilla como titular; y
+      2) tenían al menos cuatro jugadores alineados.
+
+    Se conserva la regla anterior de que los suplentes no puntúan para el manager.
+    Los puntos individuales del futbolista sí se acumulan siempre.
+    """
     with db_transaction() as conn:
         match = conn.execute(
             "SELECT id, match_date, match_time, status FROM matches WHERE id=?",
@@ -1022,6 +1085,53 @@ def process_match(match_id: int, stats: dict[int, dict[str, Any]]) -> None:
         player_ids = {int(player["id"]) for player in players}
         if set(map(int, stats.keys())) != player_ids:
             raise ValueError("La lista de jugadores ha cambiado. Recarga el formulario.")
+
+        # La fotografía se crea una sola vez. Si el partido se revierte y se
+        # reprocesa, se conserva la fotografía original del kickoff.
+        snapshot_meta = conn.execute(
+            "SELECT snapshot_status FROM match_snapshot_meta WHERE match_id=?",
+            (int(match_id),),
+        ).fetchone()
+        if snapshot_meta is not None and snapshot_meta["snapshot_status"] == "LEGACY":
+            raise ValueError(
+                "Este partido procede de una versión anterior y no dispone de una "
+                "fotografía fiable de las plantillas al inicio. No se puede reprocesar "
+                "con las nuevas condiciones sin reconstruir manualmente ese historial."
+            )
+
+        if snapshot_meta is None:
+            managers_count = int(
+                conn.execute("SELECT COUNT(*) FROM users WHERE role='user'").fetchone()[0]
+            )
+            captured_at = now_local().isoformat(timespec="seconds")
+            conn.execute(
+                """INSERT INTO match_snapshot_meta(
+                    match_id, kickoff_at, captured_at, managers_count, snapshot_status
+                ) VALUES (?, ?, ?, ?, 'CAPTURED')""",
+                (int(match_id), kickoff.isoformat(timespec="seconds"), captured_at, managers_count),
+            )
+            conn.execute(
+                """INSERT INTO match_user_snapshot(match_id, user_id, starter_count, eligible)
+                   SELECT ?, u.id,
+                          COALESCE(SUM(CASE WHEN s.is_starter=1 THEN 1 ELSE 0 END), 0),
+                          CASE WHEN COALESCE(SUM(CASE WHEN s.is_starter=1 THEN 1 ELSE 0 END), 0) >= 4
+                               THEN 1 ELSE 0 END
+                   FROM users u
+                   LEFT JOIN user_squads s ON s.user_id=u.id
+                   WHERE u.role='user'
+                   GROUP BY u.id""",
+                (int(match_id),),
+            )
+            conn.execute(
+                """INSERT INTO match_squad_snapshot(match_id, user_id, player_id, is_starter)
+                   SELECT ?, s.user_id, s.player_id, s.is_starter
+                   FROM user_squads s
+                   JOIN users u ON u.id=s.user_id
+                   WHERE u.role='user'""",
+                (int(match_id),),
+            )
+        elif snapshot_meta["snapshot_status"] != "CAPTURED":
+            raise ValueError("El estado de la fotografía de plantillas no es válido.")
 
         for player in players:
             player_id = int(player["id"])
@@ -1062,12 +1172,19 @@ def process_match(match_id: int, stats: dict[int, dict[str, Any]]) -> None:
                 (int(match_id), player_id, total_points),
             )
 
-            starters = conn.execute(
-                "SELECT s.user_id FROM user_squads s JOIN users u ON u.id=s.user_id "
-                "WHERE s.player_id=? AND s.is_starter=1 AND u.role='user'",
-                (player_id,),
+            # Se exigen simultáneamente: jugador titular en la fotografía de
+            # kickoff y al menos cuatro titulares registrados para ese manager.
+            eligible_starters = conn.execute(
+                """SELECT squad.user_id
+                   FROM match_squad_snapshot squad
+                   JOIN match_user_snapshot manager
+                     ON manager.match_id=squad.match_id AND manager.user_id=squad.user_id
+                   WHERE squad.match_id=? AND squad.player_id=?
+                     AND squad.is_starter=1 AND manager.eligible=1
+                     AND manager.starter_count >= 4""",
+                (int(match_id), player_id),
             ).fetchall()
-            for starter in starters:
+            for starter in eligible_starters:
                 user_id = int(starter["user_id"])
                 conn.execute(
                     "UPDATE users SET total_points=ROUND(COALESCE(total_points, 0)+?, 2) WHERE id=?",
@@ -1111,6 +1228,17 @@ def reverse_match(match_id: int) -> None:
                 "Se necesita una corrección manual o reconstruir ese historial antes de revertirla."
             )
 
+        snapshot_meta = conn.execute(
+            "SELECT snapshot_status FROM match_snapshot_meta WHERE match_id=?",
+            (int(match_id),),
+        ).fetchone()
+        if snapshot_meta is None or snapshot_meta["snapshot_status"] != "CAPTURED":
+            raise ValueError(
+                "Este partido se procesó con una versión anterior que no guardaba "
+                "la plantilla del inicio. No se puede revertir con garantías porque "
+                "no es posible reconstruir qué jugadores tenía cada manager en el kickoff."
+            )
+
         for item in player_history:
             cursor = conn.execute(
                 "UPDATE players SET points=ROUND(COALESCE(points, 0)-?, 2) WHERE id=?",
@@ -1134,6 +1262,8 @@ def reverse_match(match_id: int) -> None:
 
         conn.execute("DELETE FROM match_history WHERE match_id=?", (int(match_id),))
         conn.execute("DELETE FROM match_player_history WHERE match_id=?", (int(match_id),))
+        # La fotografía de kickoff se conserva para que un reprocesamiento
+        # utilice exactamente la misma plantilla y alineación originales.
         conn.execute(
             "UPDATE matches SET status='PENDIENTE' WHERE id=?", (int(match_id),)
         )
@@ -1365,6 +1495,11 @@ def admin_panel() -> None:
 
     with t4:
         st.subheader("⚽ Procesar jornada")
+        st.info(
+            "Los puntos del manager se conceden únicamente si el futbolista estaba "
+            "entre sus titulares al inicio del partido y el manager tenía al menos "
+            "4 jugadores alineados en ese momento. Los suplentes no puntúan para el manager."
+        )
         pending_df = get_dataframe(
             "SELECT id, jornada, rival, match_date, match_time FROM matches "
             "WHERE status='PENDIENTE' ORDER BY match_date, match_time, id"
@@ -1440,7 +1575,8 @@ def admin_panel() -> None:
             reverse_id = reverse_options[reverse_label]
             st.warning(
                 "La reversión resta los puntos del partido tanto a los jugadores como a los managers. "
-                "El mercado y las plantillas vuelven a quedar sujetos al estado de partido pendiente."
+                "Se conserva la fotografía de plantilla del inicio para que, si reprocesas el partido, "
+                "se utilice la alineación original. Las jornadas antiguas sin fotografía no pueden revertirse automáticamente."
             )
             if st.button("⚠️ Revertir los puntos de este partido", key="reverse_match_button"):
                 if _show_operation_error(lambda: reverse_match(reverse_id)):
@@ -1851,6 +1987,11 @@ def user_panel() -> None:
     elif menu == "📋 Mi Plantilla":
         st.markdown('<div class="fantasy-kicker">Tu equipo · Gestión de alineación</div>', unsafe_allow_html=True)
         st.title("📋 Mi plantilla")
+        st.info(
+            "Para recibir puntos de un futbolista, debes tenerlo como titular al inicio del partido "
+            "y contar con al menos 4 titulares en ese mismo instante. Con menos de 4 titulares, "
+            "ningún jugador de tu equipo te sumará puntos en ese encuentro."
+        )
         squad = get_dataframe(
             "SELECT p.id, p.name, p.position, p.price, p.points, s.is_starter "
             "FROM players p JOIN user_squads s ON p.id=s.player_id "
@@ -2365,3 +2506,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
