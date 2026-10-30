@@ -1,3 +1,6 @@
-streamlit
-pandas
-werkzeug
+
+streamlit>=1.36
+pandas>=2.0
+Werkzeug>=3.0
+tzdata>=2024.1
+
