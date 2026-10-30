@@ -378,6 +378,25 @@ def init_db() -> None:
                 FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE CASCADE
             )"""
         )
+        # Actividad social de la liga: fichajes y ventas realizados por managers.
+        # Es una tabla nueva y aditiva; no altera los datos ni las reglas existentes.
+        conn.execute(
+            """CREATE TABLE IF NOT EXISTS manager_activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                event_type TEXT NOT NULL CHECK(event_type IN ('BUY', 'SELL')),
+                player_id INTEGER,
+                player_name TEXT NOT NULL,
+                amount REAL NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                FOREIGN KEY(player_id) REFERENCES players(id) ON DELETE SET NULL
+            )"""
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_manager_activity_created "
+            "ON manager_activity(created_at DESC, id DESC)"
+        )
 
         # Migraciones para bases de datos ya existentes.
         migrations = {
@@ -950,6 +969,7 @@ def delete_manager_account(user_id: int) -> str:
         )
         conn.execute("DELETE FROM manager_points_reset_items WHERE user_id=?", (int(user_id),))
         # Borrar primero las tablas que tienen claves foráneas restrictivas.
+        conn.execute("DELETE FROM manager_activity WHERE user_id=?", (int(user_id),))
         conn.execute("DELETE FROM user_squads WHERE user_id=?", (int(user_id),))
         conn.execute("DELETE FROM ratings WHERE user_id=?", (int(user_id),))
         conn.execute("DELETE FROM match_history WHERE user_id=?", (int(user_id),))
@@ -995,7 +1015,7 @@ def buy_player(user_id: int, player_id: int) -> None:
         if locked:
             raise ValueError(reason or "El mercado está cerrado durante un partido.")
         player = conn.execute(
-            "SELECT id, price FROM players WHERE id=?", (int(player_id),)
+            "SELECT id, name, price FROM players WHERE id=?", (int(player_id),)
         ).fetchone()
         user = conn.execute(
             "SELECT rupias, role FROM users WHERE id=?", (int(user_id),)
@@ -1024,6 +1044,14 @@ def buy_player(user_id: int, player_id: int) -> None:
             "INSERT INTO user_squads(user_id, player_id, is_starter) VALUES (?, ?, 0)",
             (int(user_id), int(player_id)),
         )
+        conn.execute(
+            "INSERT INTO manager_activity(user_id, event_type, player_id, player_name, amount, created_at) "
+            "VALUES (?, 'BUY', ?, ?, ?, ?)",
+            (
+                int(user_id), int(player_id), str(player["name"]), float(player_price),
+                now_local().isoformat(timespec="seconds"),
+            ),
+        )
 
 
 def sell_player(user_id: int, player_id: int) -> float:
@@ -1032,7 +1060,7 @@ def sell_player(user_id: int, player_id: int) -> float:
         if locked:
             raise ValueError(reason or "No se pueden vender jugadores durante un partido.")
         row = conn.execute(
-            "SELECT p.price FROM user_squads s JOIN players p ON p.id=s.player_id "
+            "SELECT p.price, p.name FROM user_squads s JOIN players p ON p.id=s.player_id "
             "WHERE s.user_id=? AND s.player_id=?",
             (int(user_id), int(player_id)),
         ).fetchone()
@@ -1045,6 +1073,14 @@ def sell_player(user_id: int, player_id: int) -> float:
         )
         conn.execute(
             "UPDATE users SET rupias=rupias+? WHERE id=?", (float(price), int(user_id))
+        )
+        conn.execute(
+            "INSERT INTO manager_activity(user_id, event_type, player_id, player_name, amount, created_at) "
+            "VALUES (?, 'SELL', ?, ?, ?, ?)",
+            (
+                int(user_id), int(player_id), str(row["name"]), float(price),
+                now_local().isoformat(timespec="seconds"),
+            ),
         )
         return float(price)
 
@@ -2036,6 +2072,7 @@ def apply_global_styles() -> None:
         .fantasy-price { color: #f5d37b; font-size: 1.35rem; font-weight: 800; }
         .fantasy-green { color: #86efac; font-weight: 750; }
         .fantasy-gold { color: #f5d37b; font-weight: 750; }
+        .fantasy-callout { background: linear-gradient(110deg, rgba(33,150,95,.20), rgba(35,55,82,.32)); border: 1px solid rgba(105,225,154,.3); border-radius: 12px; padding: 13px 16px; margin: 8px 0 14px 0; }
         @media (max-width: 768px) {
             .block-container { padding-left: 1rem; padding-right: 1rem; }
             [data-testid="stMetric"] { padding: 10px 11px; }
@@ -2210,52 +2247,162 @@ def _render_dashboard(user_id: int, username: str, rupias: float) -> None:
     else:
         st.line_chart(points_history.set_index("Partido")[["Puntos"]], use_container_width=True)
 
-    c1, c2 = st.columns(2)
-    with c1:
-        st.subheader("🏅 Tus logros")
-        achievements: list[str] = []
-        if int(squad_stats["players"]) == MAX_SQUAD_SIZE:
-            achievements.append("🧩 Plantilla completa")
-        if points > 0:
-            achievements.append("⭐ Primeros puntos")
-        if rank and rank <= 3:
-            achievements.append("🏆 En el podio")
-        votes = int(run_query("SELECT COUNT(DISTINCT match_id) AS n FROM ratings WHERE user_id=?", (int(user_id),))[0]["n"])
-        if votes:
-            achievements.append("🗳️ Manager participativo")
-        if achievements:
-            for achievement in achievements:
-                st.success(achievement)
-        else:
-            st.caption("Tus primeros logros aparecerán a medida que avance la competición.")
-    with c2:
-        st.subheader("📰 Actividad reciente")
-        activity = get_dataframe(
-            "SELECT m.jornada AS Jornada, m.rival AS Rival, p.name AS Jugador, "
-            "ROUND(h.points_awarded,2) AS Puntos "
-            "FROM match_history h JOIN matches m ON m.id=h.match_id "
-            "LEFT JOIN players p ON p.id=h.player_id WHERE h.user_id=? "
-            "ORDER BY m.match_date DESC, m.match_time DESC, h.id DESC LIMIT 6",
-            (int(user_id),),
-        )
-        if activity.empty:
-            st.caption("Todavía no hay actividad puntuable.")
-        else:
-            st.dataframe(activity, use_container_width=True, hide_index=True)
+    # Reto personal y rival directo: pequeñas metas visibles que dan continuidad a la liga.
+    score_by_match = get_dataframe(
+        "SELECT m.id, m.jornada, m.rival, m.match_date, m.match_time, "
+        "ROUND(SUM(h.points_awarded),2) AS Puntos "
+        "FROM match_history h JOIN matches m ON m.id=h.match_id "
+        "WHERE h.user_id=? GROUP BY m.id, m.jornada, m.rival, m.match_date, m.match_time "
+        "ORDER BY m.match_date DESC, m.match_time DESC, m.id DESC",
+        (int(user_id),),
+    )
+    ranking_df = get_dataframe(
+        "SELECT id, username, total_points FROM users WHERE role='user' "
+        "ORDER BY total_points DESC, username ASC"
+    )
+    current_row = ranking_df[ranking_df["id"] == int(user_id)]
+    best_personal = float(score_by_match["Puntos"].max()) if not score_by_match.empty else 0.0
+    target_points = max(10.0, best_personal + 1.0)
+    last_match_points = float(score_by_match.iloc[0]["Puntos"]) if not score_by_match.empty else 0.0
 
     st.divider()
-    st.subheader("🌐 Muro de la competición")
+    challenge_col, rival_col = st.columns(2)
+    with challenge_col:
+        st.subheader("🎯 Tu próximo reto")
+        st.markdown("**Supera tu mejor jornada personal**")
+        if score_by_match.empty:
+            st.info("Tu primer objetivo: conseguir 10 puntos en una jornada.")
+        else:
+            st.metric("Tu récord personal", f"{best_personal:.2f} pts")
+            st.caption(f"Objetivo para la próxima jornada: **{target_points:.2f} puntos**.")
+            st.caption(
+                f"Último resultado: {last_match_points:.2f} puntos "
+                f"({score_by_match.iloc[0]['jornada']} · vs {score_by_match.iloc[0]['rival']})."
+            )
+            st.progress(min(1.0, max(0.0, last_match_points / target_points)))
+        st.caption("Reto personal sin bonificaciones: no modifica las reglas ni la puntuación oficial.")
+    with rival_col:
+        st.subheader("⚔️ Tu rival más cercano")
+        if len(ranking_df) <= 1 or current_row.empty:
+            st.info("Cuando haya más managers podrás competir por posiciones en la clasificación.")
+        else:
+            my_index = int(ranking_df.index[ranking_df["id"] == int(user_id)][0])
+            if my_index > 0:
+                rival_row = ranking_df.iloc[my_index - 1]
+                gap = max(0.0, float(rival_row["total_points"]) - points)
+                st.markdown(f"**Objetivo: {html.escape(str(rival_row['username']))}**")
+                st.metric("Puntos para adelantarle", f"{gap + 0.01:.2f}")
+                st.caption(f"Actualmente ocupa la posición {my_index}.")
+                denominator = max(float(rival_row["total_points"]), 1.0)
+                st.progress(min(1.0, max(0.0, points / denominator)))
+            else:
+                rival_row = ranking_df.iloc[1]
+                gap = max(0.0, points - float(rival_row["total_points"]))
+                st.markdown("**Estás en primera posición 🥇**")
+                st.metric("Ventaja sobre el segundo", f"{gap:.2f} pts")
+                st.caption(f"Tu perseguidor más cercano es {html.escape(str(rival_row['username']))}.")
+
+    c1, c2 = st.columns([1, 1.25])
+    with c1:
+        st.subheader("🏅 Colección de logros")
+        votes = int(run_query(
+            "SELECT COUNT(DISTINCT match_id) AS n FROM ratings WHERE user_id=?", (int(user_id),)
+        )[0]["n"])
+        transfers = run_query(
+            "SELECT SUM(CASE WHEN event_type='BUY' THEN 1 ELSE 0 END) AS buys, "
+            "SUM(CASE WHEN event_type='SELL' THEN 1 ELSE 0 END) AS sells "
+            "FROM manager_activity WHERE user_id=?", (int(user_id),)
+        )[0]
+        buys = int(transfers["buys"] or 0)
+        sells = int(transfers["sells"] or 0)
+        starter_count = int(run_query(
+            "SELECT COUNT(*) AS n FROM user_squads WHERE user_id=? AND is_starter=1",
+            (int(user_id),),
+        )[0]["n"])
+        managers_total = int(run_query("SELECT COUNT(*) AS n FROM users WHERE role='user'")[0]["n"])
+        hidden_gems = 0
+        if managers_total > 0:
+            hidden_gems = int(run_query(
+                "SELECT COUNT(*) AS n FROM user_squads s WHERE s.user_id=? AND "
+                "(SELECT COUNT(DISTINCT s2.user_id) FROM user_squads s2 "
+                "JOIN users u2 ON u2.id=s2.user_id WHERE s2.player_id=s.player_id AND u2.role='user') * 100.0 / ? < 25",
+                (int(user_id), managers_total),
+            )[0]["n"])
+        played_matches = int(score_by_match.shape[0])
+        double_digit = bool(
+            not score_by_match.empty and float(score_by_match["Puntos"].max()) >= 10
+        )
+        badges = [
+            ("🧩", "Plantilla completa", "Reúne cinco futbolistas.", int(squad_stats["players"]) >= MAX_SQUAD_SIZE, min(1.0, int(squad_stats["players"]) / MAX_SQUAD_SIZE)),
+            ("🎯", "Once completo", "Alinea cuatro titulares.", starter_count >= MAX_STARTERS, min(1.0, starter_count / MAX_STARTERS)),
+            ("🛒", "Primer fichaje", "Realiza tu primer fichaje.", buys >= 1, min(1.0, buys / 1)),
+            ("💸", "Manager activo", "Completa cinco operaciones de mercado.", buys + sells >= 5, min(1.0, (buys + sells) / 5)),
+            ("🗳️", "Voz de la liga", "Participa en tres votaciones.", votes >= 3, min(1.0, votes / 3)),
+            ("🕵️", "Cazatalentos", "Ficha un jugador con menos del 25 % de propietarios.", hidden_gems >= 1, 1.0 if hidden_gems else 0.0),
+            ("🔥", "Doble dígito", "Consigue al menos 10 puntos en una jornada.", double_digit, 1.0 if double_digit else min(1.0, best_personal / 10)),
+            ("📅", "Manager constante", "Participa en tres jornadas procesadas.", played_matches >= 3, min(1.0, played_matches / 3)),
+            ("🏆", "En el podio", "Alcanza una de las tres primeras posiciones.", bool(rank and rank <= 3), 1.0 if rank and rank <= 3 else 0.0),
+        ]
+        unlocked_count = sum(1 for badge in badges if badge[3])
+        st.caption(f"{unlocked_count} de {len(badges)} logros desbloqueados")
+        for idx in range(0, len(badges), 2):
+            cols = st.columns(2)
+            for offset, badge_data in enumerate(badges[idx:idx + 2]):
+                emoji, title, description, unlocked, progress_value = badge_data
+                with cols[offset]:
+                    with st.container(border=True):
+                        st.markdown(f"### {emoji} {title}" if unlocked else f"### 🔒 {title}")
+                        st.caption(description)
+                        if unlocked:
+                            st.success("Desbloqueado")
+                        else:
+                            st.progress(float(progress_value))
+
+    with c2:
+        st.subheader("📰 Tu actividad reciente")
+        personal_activity = get_dataframe(
+            "SELECT event_type, player_name, amount, created_at FROM manager_activity "
+            "WHERE user_id=? ORDER BY id DESC LIMIT 6", (int(user_id),)
+        )
+        if personal_activity.empty:
+            st.info("Tus fichajes y ventas aparecerán aquí cuando empieces a operar en el mercado.")
+        else:
+            for _, event in personal_activity.iterrows():
+                icon = "🟢" if event["event_type"] == "BUY" else "🔴"
+                action = "Has fichado" if event["event_type"] == "BUY" else "Has vendido"
+                with st.container(border=True):
+                    st.markdown(
+                        f"{icon} **{action} {html.escape(str(event['player_name']))}**"
+                    )
+                    a1, a2 = st.columns(2)
+                    a1.metric("Importe", f"{format_rupias(event['amount'])} ₹")
+                    a2.caption(str(event["created_at"]).replace("T", " · "))
+
+    st.divider()
+    st.subheader("🌐 Muro de la competición · Últimos movimientos")
     league_feed = get_dataframe(
-        "SELECT u.username AS Manager, m.jornada AS Jornada, m.rival AS Rival, "
-        "p.name AS Jugador, ROUND(h.points_awarded,2) AS Puntos "
-        "FROM match_history h JOIN users u ON u.id=h.user_id "
-        "JOIN matches m ON m.id=h.match_id LEFT JOIN players p ON p.id=h.player_id "
-        "ORDER BY m.match_date DESC, m.match_time DESC, h.id DESC LIMIT 10"
+        "SELECT u.username, a.event_type, a.player_name, a.amount, a.created_at "
+        "FROM manager_activity a JOIN users u ON u.id=a.user_id "
+        "WHERE u.role='user' ORDER BY a.id DESC LIMIT 12"
     )
     if league_feed.empty:
-        st.caption("La actividad de la competición aparecerá cuando se procese la primera jornada.")
+        st.caption("Los fichajes y ventas de los managers aparecerán aquí.")
     else:
-        st.dataframe(league_feed, use_container_width=True, hide_index=True)
+        feed_cols = st.columns(2)
+        for idx, (_, event) in enumerate(league_feed.iterrows()):
+            with feed_cols[idx % 2]:
+                bought = event["event_type"] == "BUY"
+                icon = "🟢" if bought else "🔴"
+                verb = "ha fichado" if bought else "ha vendido"
+                with st.container(border=True):
+                    st.markdown(
+                        f"{icon} **{html.escape(str(event['username']))}** {verb} "
+                        f"**{html.escape(str(event['player_name']))}**"
+                    )
+                    st.caption(
+                        f"{format_rupias(event['amount'])} rupias · "
+                        f"{str(event['created_at']).replace('T', ' · ')}"
+                    )
 
 
 # ============================================================
@@ -2459,6 +2606,21 @@ def user_panel() -> None:
         top2.metric("Managers registrados", int(all_market_df["total_managers"].max() or 0))
         top3.metric("Tu saldo", f"{format_rupias(rupias)} ₹")
 
+        # Tendencias rápidas de mercado para descubrir futbolistas demandados.
+        trend_source = all_market_df.sort_values(
+            ["ownership_pct", "points"], ascending=[False, False]
+        ).head(3)
+        if not trend_source.empty:
+            st.subheader("🔥 Más demandados de la liga")
+            trend_cols = st.columns(len(trend_source))
+            for trend_col, (_, trend_player) in zip(trend_cols, trend_source.iterrows()):
+                with trend_col:
+                    with st.container(border=True):
+                        st.markdown(f"**{html.escape(str(trend_player['name']))}**")
+                        st.caption(str(trend_player["position"]))
+                        st.metric("Propietarios", f"{float(trend_player['ownership_pct']):.1f}%")
+                        st.caption(f"{format_rupias(trend_player['price'])} ₹ · {float(trend_player['points']):.1f} pts")
+
         st.subheader("🔎 Encuentra tu próximo fichaje")
         f1, f2, f3 = st.columns([2, 1.2, 1.4])
         query = f1.text_input("Buscar futbolista", placeholder="Escribe un nombre...", key="market_search")
@@ -2561,6 +2723,54 @@ def user_panel() -> None:
                     st.session_state.pop("pending_buy_player_id", None)
                     st.rerun()
 
+        with st.expander("⚔️ Comparador de futbolistas"):
+            compare_options = {
+                f"{row['name']} ({row['position']})": int(row["id"])
+                for _, row in all_market_df.iterrows()
+            }
+            if len(compare_options) < 2:
+                st.caption("Necesitas al menos dos futbolistas para compararlos.")
+            else:
+                compare_labels = list(compare_options.keys())
+                cmp1, cmp2 = st.columns(2)
+                player_a_label = cmp1.selectbox("Primer futbolista", compare_labels, key="compare_player_a")
+                player_b_default = 1 if len(compare_labels) > 1 else 0
+                player_b_label = cmp2.selectbox("Segundo futbolista", compare_labels, index=player_b_default, key="compare_player_b")
+                if player_a_label == player_b_label:
+                    st.info("Selecciona dos futbolistas diferentes.")
+                else:
+                    player_a = all_market_df[all_market_df["id"] == compare_options[player_a_label]].iloc[0]
+                    player_b = all_market_df[all_market_df["id"] == compare_options[player_b_label]].iloc[0]
+                    comparison_cols = st.columns(2)
+                    for col, player_row in zip(comparison_cols, [player_a, player_b]):
+                        with col:
+                            with st.container(border=True):
+                                st.markdown(f"### {html.escape(str(player_row['name']))}")
+                                st.caption(str(player_row["position"]))
+                                st.metric("Precio", f"{format_rupias(player_row['price'])} ₹")
+                                st.metric("Puntos", f"{float(player_row['points']):.2f}")
+                                st.metric("Propietarios", f"{float(player_row['ownership_pct']):.1f}%")
+                    compare_index = [str(player_a["name"]), str(player_b["name"])]
+                    compare_tabs = st.tabs(["Puntos", "Precio", "Demanda"])
+                    with compare_tabs[0]:
+                        points_chart = pd.DataFrame(
+                            {"Puntos": [float(player_a["points"]), float(player_b["points"])]},
+                            index=compare_index,
+                        )
+                        st.bar_chart(points_chart, use_container_width=True)
+                    with compare_tabs[1]:
+                        price_chart = pd.DataFrame(
+                            {"Precio (rupias)": [float(player_a["price"]), float(player_b["price"])]},
+                            index=compare_index,
+                        )
+                        st.bar_chart(price_chart, use_container_width=True)
+                    with compare_tabs[2]:
+                        demand_chart = pd.DataFrame(
+                            {"Propietarios (%)": [float(player_a["ownership_pct"]), float(player_b["ownership_pct"])]},
+                            index=compare_index,
+                        )
+                        st.bar_chart(demand_chart, use_container_width=True)
+
         with st.expander("📊 Ficha completa e historial de precios"):
             profile_options = {
                 f"{row['name']} ({row['position']}) · ID {row['id']}": int(row["id"])
@@ -2618,7 +2828,13 @@ def user_panel() -> None:
         if vote_players.empty:
             st.info("No hay jugadores disponibles para votar.")
             return
-        st.caption("Valora a todos los futbolistas del 1 al 5. Solo puedes enviar una votación por partido.")
+        st.markdown(
+            "<div class='fantasy-callout'>⭐ <b>Tu valoración influye en la puntuación final.</b> "
+            "1 = actuación muy mala · 3 = actuación correcta · 5 = actuación excelente. "
+            "Valora a todos los futbolistas con el mismo criterio.</div>",
+            unsafe_allow_html=True,
+        )
+        st.caption("Solo puedes enviar una votación por partido. Una vez enviada, no podrás modificarla.")
         with st.form(f"vote_form_{match_id}"):
             vote_inputs: dict[int, int] = {}
             for start_index in range(0, len(vote_players), 2):
