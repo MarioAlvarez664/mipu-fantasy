@@ -758,6 +758,40 @@ def adjust_user_money(user_id: int, amount: float) -> None:
             raise ValueError("No existe ningún manager con ese ID.")
 
 
+def reset_manager_password(user_id: int, new_password: str) -> None:
+    """Restablece la contraseña de un manager sin revelar la contraseña anterior."""
+    if len(new_password) < 8:
+        raise ValueError("La nueva contraseña debe tener al menos 8 caracteres.")
+    with db_transaction() as conn:
+        cursor = conn.execute(
+            "UPDATE users SET password=? WHERE id=? AND role='user'",
+            (generate_password_hash(new_password), int(user_id)),
+        )
+        if cursor.rowcount == 0:
+            raise ValueError("No existe ningún manager con ese ID. La cuenta de administrador no se puede modificar aquí.")
+
+
+def delete_manager_account(user_id: int) -> str:
+    """Elimina una cuenta de manager y sus registros dependientes de forma atómica."""
+    with db_transaction() as conn:
+        user = conn.execute(
+            "SELECT id, username, role FROM users WHERE id=?", (int(user_id),)
+        ).fetchone()
+        if user is None or user["role"] != "user":
+            raise ValueError("La cuenta no existe o no es una cuenta de manager. El administrador está protegido.")
+
+        # Borrar primero las tablas que tienen claves foráneas restrictivas.
+        conn.execute("DELETE FROM user_squads WHERE user_id=?", (int(user_id),))
+        conn.execute("DELETE FROM ratings WHERE user_id=?", (int(user_id),))
+        conn.execute("DELETE FROM match_history WHERE user_id=?", (int(user_id),))
+        cursor = conn.execute(
+            "DELETE FROM users WHERE id=? AND role='user'", (int(user_id),)
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("No se pudo eliminar la cuenta.")
+        return str(user["username"])
+
+
 
 
 def set_starter(user_id: int, player_id: int, make_starter: bool) -> None:
@@ -1108,8 +1142,8 @@ def _show_operation_error(action) -> bool:
 
 def admin_panel() -> None:
     st.header("👑 Panel de Control — Administrador")
-    t1, t2, t3, t4 = st.tabs(
-        ["📅 Partidos", "⚽ Jugadores", "💸 Economía y Mercado", "📊 Puntuaciones"]
+    t1, t2, t3, t4, t5 = st.tabs(
+        ["📅 Partidos", "⚽ Jugadores", "💸 Economía y Mercado", "📊 Puntuaciones", "👥 Usuarios"]
     )
 
     with t1:
@@ -1318,6 +1352,120 @@ def admin_panel() -> None:
             if st.button("⚠️ Revertir los puntos de este partido", key="reverse_match_button"):
                 if _show_operation_error(lambda: reverse_match(reverse_id)):
                     st.success("Puntuaciones revertidas; el partido vuelve a estar pendiente.")
+                    st.rerun()
+
+    with t5:
+        st.subheader("👥 Cuentas y perfiles registrados")
+        st.info(
+            "Aquí puedes consultar las cuentas de los managers, sus puntos, saldo y plantilla. "
+            "Las contraseñas nunca se muestran porque se almacenan mediante hash; puedes restablecerlas."
+        )
+        accounts_df = get_dataframe(
+            "SELECT u.id AS ID, u.username AS Usuario, u.role AS Rol, "
+            "ROUND(u.rupias, 2) AS Rupias, ROUND(u.total_points, 2) AS Puntos, "
+            "COUNT(DISTINCT s.player_id) AS Jugadores, "
+            "COUNT(DISTINCT r.match_id) AS Partidos_votados "
+            "FROM users u "
+            "LEFT JOIN user_squads s ON s.user_id=u.id "
+            "LEFT JOIN ratings r ON r.user_id=u.id "
+            "GROUP BY u.id, u.username, u.role, u.rupias, u.total_points "
+            "ORDER BY CASE WHEN u.role='admin' THEN 0 ELSE 1 END, u.username"
+        )
+        st.dataframe(accounts_df, use_container_width=True, hide_index=True)
+
+        manager_rows = run_query(
+            "SELECT id, username FROM users WHERE role='user' ORDER BY username"
+        )
+        if not manager_rows:
+            st.info("Todavía no hay cuentas de managers registradas.")
+        else:
+            manager_options = {
+                f"{row['username']} (ID {row['id']})": int(row["id"])
+                for row in manager_rows
+            }
+
+            st.subheader("Consultar perfil y plantilla")
+            selected_profile_label = st.selectbox(
+                "Selecciona un manager",
+                list(manager_options.keys()),
+                key="admin_profile_select",
+            )
+            selected_profile_id = manager_options[selected_profile_label]
+            profile_df = get_dataframe(
+                "SELECT username AS Usuario, ROUND(rupias, 2) AS Rupias, "
+                "ROUND(total_points, 2) AS Puntos_totales "
+                "FROM users WHERE id=? AND role='user'",
+                (selected_profile_id,),
+            )
+            squad_df = get_dataframe(
+                "SELECT p.name AS Jugador, p.position AS Posicion, "
+                "ROUND(p.price, 2) AS Precio, "
+                "CASE WHEN s.is_starter=1 THEN 'Titular' ELSE 'Suplente' END AS Estado "
+                "FROM user_squads s JOIN players p ON p.id=s.player_id "
+                "WHERE s.user_id=? ORDER BY s.is_starter DESC, p.position, p.name",
+                (selected_profile_id,),
+            )
+            c1, c2 = st.columns([1, 2])
+            with c1:
+                st.dataframe(profile_df, use_container_width=True, hide_index=True)
+            with c2:
+                st.write("**Plantilla actual**")
+                if squad_df.empty:
+                    st.caption("Este manager todavía no tiene jugadores.")
+                else:
+                    st.dataframe(squad_df, use_container_width=True, hide_index=True)
+
+            st.divider()
+            st.subheader("🔑 Restablecer contraseña de un manager")
+            st.caption(
+                "No es posible consultar la contraseña actual. Introduce una nueva para sustituirla."
+            )
+            with st.form("reset_manager_password_form"):
+                reset_label = st.selectbox(
+                    "Cuenta", list(manager_options.keys()), key="reset_password_user_select"
+                )
+                new_password = st.text_input(
+                    "Nueva contraseña", type="password", key="reset_manager_password_new"
+                )
+                confirm_password = st.text_input(
+                    "Repetir nueva contraseña", type="password", key="reset_manager_password_confirm"
+                )
+                reset_submitted = st.form_submit_button("Guardar nueva contraseña")
+            if reset_submitted:
+                if new_password != confirm_password:
+                    st.error("Las contraseñas no coinciden.")
+                elif _show_operation_error(
+                    lambda: reset_manager_password(manager_options[reset_label], new_password)
+                ):
+                    st.success(f"Contraseña actualizada para {reset_label}.")
+                    st.rerun()
+
+            st.divider()
+            st.subheader("🗑️ Eliminar cuenta de manager")
+            st.warning(
+                "La eliminación es permanente. También se borrarán su plantilla, sus votos y "
+                "su historial individual como manager. Sus puntos dejarán de aparecer en la clasificación. "
+                "No se puede eliminar la cuenta de administrador desde aquí."
+            )
+            with st.form("delete_manager_account_form"):
+                delete_label = st.selectbox(
+                    "Cuenta que quieres eliminar",
+                    list(manager_options.keys()),
+                    key="delete_manager_user_select",
+                )
+                expected_username = delete_label.rsplit(" (ID ", 1)[0]
+                typed_username = st.text_input(
+                    f"Escribe {expected_username} para confirmar",
+                    key="delete_manager_username_confirm",
+                )
+                delete_submitted = st.form_submit_button("Eliminar definitivamente la cuenta")
+            if delete_submitted:
+                if typed_username.strip().lower() != expected_username.lower():
+                    st.error("El nombre escrito no coincide. No se ha eliminado ninguna cuenta.")
+                elif _show_operation_error(
+                    lambda: delete_manager_account(manager_options[delete_label])
+                ):
+                    st.success(f"La cuenta {expected_username} se ha eliminado.")
                     st.rerun()
 
 
